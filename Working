@@ -1,0 +1,29 @@
+should_clauses = []
+
+if first_name:
+    should_clauses.append({
+        "wildcard": {"first_name": {"value": first_name.lower() + "*"}}
+    })
+
+if last_name:
+    should_clauses.append({
+        "match": {"last_name": {"query": last_name.lower(), "fuzziness": "1"}}
+    })
+    should_clauses.append({
+        "wildcard": {"last_name": {"value": last_name.lower() + "*"}}
+    })
+
+if account_name:
+    should_clauses.append({
+        "match": {"job_company_name": {"query": account_name.lower(), "fuzziness": "AUTO"}}
+    })
+    should_clauses.append({
+        "wildcard": {"job_company_name": {"value": "*".join(account_name.lower().split()) + "*"}}
+    })
+
+PARAMS = {
+    'query': {"bool": {"should": should_clauses, "minimum_should_match": 2}},
+    'size': 5,
+    'pretty': True,
+    'titlecase': True
+}
