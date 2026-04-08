@@ -1,6 +1,5 @@
 import sys
 import json
-import uuid
 import time
 import requests
 import pandas as pd
@@ -48,12 +47,12 @@ try:
     # ── 1. Pull unprocessed records from Snowflake ──────────────────────
     query = f"""
         SELECT
-            ROW_ID,
+            RECORD_ID,
             WORKER_ID,
             CLIENT_ID,
             CLIENT_NAME,
-            CONCAT(FIRST_NAME, ' ', LAST_NAME) AS WORKER_NAME,
-            CLIENT_NAME AS ACCOUNT_NAME
+            FIRST_NAME,
+            LAST_NAME
         FROM {source_table}
         WHERE API_PROCESSED = FALSE;
     """
@@ -74,55 +73,34 @@ try:
     for idx, row in rows.iterrows():
         try:
             # Sanitise inputs
-            contact_name = (
-                row['WORKER_NAME'].replace("'", "''")
-                if pd.notna(row['WORKER_NAME']) else ""
+            first_name = (
+                row['FIRST_NAME'].replace("'", "''")
+                if pd.notna(row['FIRST_NAME']) else ""
+            )
+            last_name = (
+                row['LAST_NAME'].replace("'", "''")
+                if pd.notna(row['LAST_NAME']) else ""
             )
             account_name = (
-                row['ACCOUNT_NAME'].replace("'", "''")
-                if pd.notna(row['ACCOUNT_NAME']) else ""
+                row['CLIENT_NAME'].replace("'", "''")
+                if pd.notna(row['CLIENT_NAME']) else ""
             )
-
-            # Tokenise for wildcard patterns
-            contact_tokens = contact_name.lower().split()
-            account_tokens = account_name.lower().split()
-
-            # e.g. "john smith" -> "john*smith*"
-            contact_wildcard = "*".join(contact_tokens) + "*"
-            account_wildcard = "*".join(account_tokens) + "*"
+            record_id_sql = str(row['RECORD_ID']).replace("'", "''")
 
             # ── Fuzzy + wildcard ES query ────────────────────────────────
             # All clauses are 'should' - no hard requirements.
             # minimum_should_match=2 means at least 2 signals must align,
-            # preventing a single first name from pulling everyone named John
+            # preventing a single token from pulling everyone with that name
             # while still being loose enough to handle dirty/abbreviated data.
             PARAMS = {
                 'query': {
                     "bool": {
                         "should": [
-                            # Full name fuzzy
-                            {
-                                "match": {
-                                    "full_name": {
-                                        "query": contact_name.lower(),
-                                        "fuzziness": "AUTO",
-                                        "operator": "and"
-                                    }
-                                }
-                            },
-                            # Full name wildcard
-                            {
-                                "wildcard": {
-                                    "full_name": {
-                                        "value": contact_wildcard
-                                    }
-                                }
-                            },
                             # First name wildcard (Jon vs Jonathan)
                             {
                                 "wildcard": {
                                     "first_name": {
-                                        "value": contact_tokens[0] + "*" if contact_tokens else "*"
+                                        "value": first_name.lower() + "*"
                                     }
                                 }
                             },
@@ -130,8 +108,16 @@ try:
                             {
                                 "match": {
                                     "last_name": {
-                                        "query": contact_tokens[-1] if contact_tokens else "",
+                                        "query": last_name.lower(),
                                         "fuzziness": "1"
+                                    }
+                                }
+                            },
+                            # Last name wildcard
+                            {
+                                "wildcard": {
+                                    "last_name": {
+                                        "value": last_name.lower() + "*"
                                     }
                                 }
                             },
@@ -148,7 +134,7 @@ try:
                             {
                                 "wildcard": {
                                     "job_company_name": {
-                                        "value": account_wildcard
+                                        "value": "*".join(account_name.lower().split()) + "*"
                                     }
                                 }
                             }
@@ -171,7 +157,7 @@ try:
             ).json()
 
             response_status = response.get('status', None)
-            response_data   = json.dumps(response.get('data', [])).replace("'", "\\'")
+            response_data   = json.dumps(response.get('data', []))
             total_matches   = int(response.get('total', 0))
             response_time   = str(datetime.now())
 
@@ -189,10 +175,10 @@ try:
                     API_PROCESSED        = TRUE,
                     API_PROCESSED_AT     = CURRENT_TIMESTAMP(),
                     API_RESPONSE_STATUS  = {response_status if response_status is not None else 'NULL'},
-                    API_RESPONSE_DATA    = PARSE_JSON('{response_data}'),
+                    API_RESPONSE_DATA    = PARSE_JSON($${response_data}$$),
                     API_TOTAL_MATCHES    = {total_matches},
                     API_RESPONSE_TIME    = '{response_time}'
-                WHERE ROW_ID = {row['ROW_ID']};
+                WHERE RECORD_ID = '{record_id_sql}';
             """
             session.sql(update_query).collect()
 
@@ -201,14 +187,14 @@ try:
                 success_count += 1
                 print(
                     f"Row {idx + 1}/{rows.shape[0]}: "
-                    f"Match found for {row['WORKER_NAME']} "
-                    f"({total_matches} candidates) - updated ROW_ID {row['ROW_ID']}"
+                    f"Match found for {first_name} {last_name} "
+                    f"({total_matches} candidates) - updated RECORD_ID {record_id_sql}"
                 )
             else:
                 print(
                     f"Row {idx + 1}/{rows.shape[0]}: "
-                    f"No match for {row['WORKER_NAME']} "
-                    f"- Status: {response_status} - updated ROW_ID {row['ROW_ID']}"
+                    f"No match for {first_name} {last_name} "
+                    f"- Status: {response_status} - updated RECORD_ID {record_id_sql}"
                 )
 
             # Small delay to avoid rate limiting
@@ -216,7 +202,7 @@ try:
 
         except Exception as row_error:
             error_count += 1
-            print(f"Error processing row {idx + 1} (ROW_ID {row['ROW_ID']}): {row_error}")
+            print(f"Error processing row {idx + 1} (RECORD_ID {row['RECORD_ID']}): {row_error}")
 
             # Mark row so it doesn't get retried endlessly
             try:
@@ -229,11 +215,11 @@ try:
                         API_RESPONSE_DATA    = PARSE_JSON('[]'),
                         API_TOTAL_MATCHES    = 0,
                         API_RESPONSE_TIME    = '{str(datetime.now())}'
-                    WHERE ROW_ID = {row['ROW_ID']};
+                    WHERE RECORD_ID = '{str(row["RECORD_ID"]).replace("'", "''")}';
                 """
                 session.sql(error_update).collect()
             except Exception as update_error:
-                print(f"  Also failed to write error state for ROW_ID {row['ROW_ID']}: {update_error}")
+                print(f"  Also failed to write error state for RECORD_ID {row['RECORD_ID']}: {update_error}")
 
     # ── 4. Summary ───────────────────────────────────────────────────────
     print(
