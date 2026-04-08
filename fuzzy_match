@@ -1,354 +1,144 @@
+#--------------------------------------------------------------------------------------
+# Project:      People Data Labs - Test API Integration
+# Author:       Marlin Myers
+# Created:      03/25/2026
+# Last Updated: 03/26/2026
+#--------------------------------------------------------------------------------------
+from __future__ import annotations
+import snowflake.snowpark as snowpark
+import pandas as pd
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import when_matched, current_timestamp, when
+from snowflake.connector.pandas_tools import write_pandas
+from datetime import datetime, timedelta, date
+import time
 import sys
 import json
-import uuid
-import time
 import requests
-import pandas as pd
-from datetime import datetime
+import re
+import uuid 
 
-# ─────────────────────────────────────────────
-# Snowflake / local environment setup
-# ─────────────────────────────────────────────
+# def current_environment(session):
+#     current_account = session.sql("SELECT CURRENT_ACCOUNT()").collect()
+#     account_str = current_account[0][0]
+#     if account_str.upper() == "WFA86990":
+#         return "N1"
+#     elif account_str.upper() == "DMA53285":
+#         return "PR"
+#     else:
+#         raise ValueError(f"{account_str.upper()} is an invalid account for deployment.")  
 
-try:
-    import _snowflake  # Available when deployed to Snowflake
-    from snowflake.snowpark import Session
+def main(session: Session):
+    
+    try: 
+        import _snowflake # Try to import the _snowflake module (needed for Snowflake secrets when deployed to Snowflake Cloud)
 
-    API_KEY = _snowflake.get_generic_secret_string('TOKEN')
-    PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
-    ssl_verify = True
-
-except ImportError:
-    import os
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    import config  # Local config.py for debugging
-
-    API_KEY = config.API_KEY
-    PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
-    ssl_verify = False
+        API_KEY = _snowflake.get_generic_secret_string('TOKEN')
+        PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
+        ssl_verify = True
 
 
-# ─────────────────────────────────────────────
-# Main Snowpark entrypoint
-# ─────────────────────────────────────────────
+    except:
+        import os
+        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+        import config # import the config.py file for local debugging
 
-def main(session: "Session"):
+
+
+        API_KEY = config.API_KEY
+        PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
+        ssl_verify = False
+
+
 
     try:
-        # ── 1. Pull unprocessed records from Snowflake ──────────────────────
+        # env = current_environment(session)
+        # Query Snowflake for data 
         query = f"""
-            SELECT
-                ROW_ID,
-                WORKER_ID,
-                CLIENT_ID,
-                CLIENT_NAME,
-                CONCAT(FIRST_NAME, ' ', LAST_NAME) AS WORKER_NAME,
-                CLIENT_NAME AS ACCOUNT_NAME
-            FROM SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
-            WHERE API_PROCESSED = FALSE;
+                SELECT 
+                    RECORD_ID,
+                    CLIENT_NAME, 
+                    FIRST_NAME,
+                    LAST_NAME
+                FROM SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
+                WHERE API_PROCESSED = FALSE
+                LIMIT 1;
+
         """
-
         rows = pd.DataFrame(session.sql(query).collect())
-        print(f"\nProcessing {rows.shape[0]} rows")
 
-        # ── 2. Set request headers ───────────────────────────────────────────
+        print(f"Processing {rows.shape[0]} rows")
+
+        
+        # Set headers
         HEADERS = {
-            'Content-Type': 'application/json',
-            'X-api-key': API_KEY
+        'Content-Type': "application/json",
+        'X-api-key': API_KEY
         }
 
-        results = []
+        success_count = 0
+        error_count = 0
 
-        # ── 3. Iterate rows and call PDL ─────────────────────────────────────
+        # Iterate through each row in the dataframe
         for idx, row in rows.iterrows():
             try:
-                # Sanitise inputs
-                contact_name = (
-                    row['WORKER_NAME'].replace("'", "''")
-                    if pd.notna(row['WORKER_NAME']) else ""
-                )
-                account_name = (
-                    row['ACCOUNT_NAME'].replace("'", "''")
-                    if pd.notna(row['ACCOUNT_NAME']) else ""
-                )
+                record_id_sql = str(row['RECORD_ID']).replace("'", "''")
 
-                # ── Fuzzy ES query (replaces exact SQL match) ────────────────
-                # Uses 'match' with fuzziness=AUTO so minor name/company
-                # variations (typos, nicknames, abbreviations) still resolve.
-                # operator='and' ensures BOTH tokens in a name must appear,
-                # preventing false positives like "John" matching every John
-                # at the company.
-                # size=5 returns top candidates; adjust as needed.
+                # Escape single quotes in names to prevent SQL injection/errors
+                first_name = row['FIRST_NAME'].replace("'", "''") if pd.notna(row['FIRST_NAME']) else ''
+                last_name = row['LAST_NAME'].replace("'", "''") if pd.notna(row['LAST_NAME']) else ''
+                account_name = row['CLIENT_NAME'].replace("'", "''") if pd.notna(row['CLIENT_NAME']) else ''
+                record_id_sql = str(row['RECORD_ID']).replace("'", "''")
+                
+                # Create ES Query for Fuszzy Matching
                 PARAMS = {
-                    'query': {
-                        "bool": {
-                            "must": [
-                                {
-                                    "match": {
-                                        "full_name": {
-                                            "query": contact_name.lower(),
-                                            "fuzziness": "AUTO",
-                                            "operator": "and"
-                                        }
-                                    }
-                                },
-                                {
-                                    "match": {
-                                        "job_company_name": {
-                                            "query": account_name.lower(),
-                                            "fuzziness": "AUTO",
-                                            "operator": "and"
-                                        }
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                    'size': 5,
-                    'pretty': True,
-                    'titlecase': True
-                }
-
-                # ── Fire request ─────────────────────────────────────────────
-                response = requests.get(
-                    PDL_URL,
-                    headers=HEADERS,
-                    params={"api_key": API_KEY},
-                    json=PARAMS,
-                    verify=ssl_verify
-                ).json()
-
-                # ── Store result record ──────────────────────────────────────
-                result_record = {
-                    'REQUEST_UUID':      str(uuid.uuid4()),
-                    'ROW_ID':            row['ROW_ID'],
-                    'WORKER_ID':         row['WORKER_ID'],
-                    'CONTACT_NAME':      row['WORKER_NAME'],
-                    'ACCOUNT_ID':        row['CLIENT_ID'],
-                    'ACCOUNT_NAME':      row['CLIENT_NAME'],
-                    'RESPONSE_STATUS':   response.get('status', None),
-                    'RESPONSE_DATA':     json.dumps(response.get('data', [])),
-                    'TOTAL_MATCHES':     int(response.get('total', 0)),
-                    'API_RESPONSE_TIME': str(datetime.now())
-                }
-
-                results.append(result_record)
-
-                # ── Log progress ─────────────────────────────────────────────
-                if response.get("status") == 200:
-                    print(
-                        f"Row {idx + 1}/{rows.shape[0]}: "
-                        f"Match found for {row['WORKER_NAME']} "
-                        f"({response.get('total', 0)} candidates)"
-                    )
-                else:
-                    print(
-                        f"Row {idx + 1}/{rows.shape[0]}: "
-                        f"No match for {row['WORKER_NAME']} "
-                        f"- Status: {response.get('status')}"
-                    )
-
-                # Small delay to avoid rate limiting
-                time.sleep(1)
-
-            except Exception as row_error:
-                print(f"Error processing row {idx + 1}: {row_error}")
-                results.append({
-                    'REQUEST_UUID':      str(uuid.uuid4()),
-                    'ROW_ID':            row['ROW_ID'],
-                    'WORKER_ID':         row.get('WORKER_ID', None),
-                    'CONTACT_NAME':      row.get('WORKER_NAME', None),
-                    'ACCOUNT_ID':        row.get('CLIENT_ID', None),
-                    'ACCOUNT_NAME':      row.get('CLIENT_NAME', None),
-                    'RESPONSE_STATUS':   None,
-                    'RESPONSE_DATA':     json.dumps([]),
-                    'TOTAL_MATCHES':     0,
-                    'API_RESPONSE_TIME': str(datetime.now())
-                })
-
-        # ── 4. Write results to Snowflake ────────────────────────────────────
-        results_df = pd.DataFrame(results)
-        print(f"\nProcessed {len(results)} records. Writing to Snowflake...")
-
-        table_name = "SANDBOX.MMYERS.PDL_DNB_CEO_RESULTS_TEST"
-
-        from snowflake.snowpark import functions as F
-        snowpark_df = session.create_dataframe(results_df)
-        snowpark_df = snowpark_df.with_column(
-            "RESPONSE_DATA",
-            F.parse_json(snowpark_df["RESPONSE_DATA"])
-        )
-        snowpark_df.write.mode("append").save_as_table(table_name)
-
-        print(f"Successfully wrote {len(results)} records to {table_name}")
-
-        # ── 5. Mark processed records in source table ────────────────────────
-        processed_ids = results_df['ROW_ID'].dropna().tolist()
-
-        if processed_ids:
-            id_list = ", ".join(str(rid) for rid in processed_ids)
-            update_query = f"""
-                UPDATE SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
-                SET API_PROCESSED = TRUE,
-                    API_PROCESSED_AT = CURRENT_TIMESTAMP()
-                WHERE ROW_ID IN ({id_list});
-            """
-            session.sql(update_query).collect()
-            print(f"Updated {len(processed_ids)} records as processed in SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS")
-
-        # ── 6. Summary ───────────────────────────────────────────────────────
-        success_count = results_df[results_df['RESPONSE_STATUS'] == 200].shape[0]
-        print(f"\nSummary: {success_count} successful matches out of {len(results)} total requests")
-
-    except Exception as e:
-        print(e)
-
-        # Save local backup on failure (only useful during local debugging)
-        try:
-            with open(
-                r'c:\Users\mmyers1\Azure_Devops\snflk-dataload-people-data-labs\jira-api\snowpark\results_backup.json',
-                'w'
-            ) as f:
-                json.dump(results, f, indent=2)
-            print(f"Saved {len(results)} records to results_backup.json")
-
-            results_df.to_csv(
-                r'c:\Users\mmyers1\Azure_Devops\snflk-dataload-people-data-labs\jira-api\snowpark\results_backup.csv',
-                index=False
-            )
-            print(f"Saved {len(results_df)} records to results_backup.csv")
-        except Exception:
-            pass  # backup paths only exist locally; safe to skip in Snowflake
-
-        raise e
-
-    return 'Process Complete'
-
-
-# ─────────────────────────────────────────────
-# Local debugging entrypoint
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    # NOTE: Session is only available inside Snowflake.
-    # To run locally, mock the session or use a local Snowpark connection.
-    try:
-        from snowflake.snowpark import Session
-        with Session.builder.config("local_testing", True).getOrCreate() as session:
-            print(main(session, *sys.argv[1:]))
-    except Exception as e:
-        print(f"Local run error: {e}")
-        print("Tip: Session is a Snowflake runtime object. Run this inside Snowflake or set up a local Snowpark connection via config.py")
-
-import sys
-import json
-import uuid
-import time
-import requests
-import pandas as pd
-from datetime import datetime
-
-# ─────────────────────────────────────────────
-
-# Snowflake / local environment setup
-
-# ─────────────────────────────────────────────
-
-try:
-import _snowflake  # Available when deployed to Snowflake
-from snowflake.snowpark import Session
-
-```
-API_KEY = _snowflake.get_generic_secret_string('TOKEN')
-PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
-ssl_verify = True
-```
-
-except ImportError:
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(**file**), ‘..’)))
-import config  # Local config.py for debugging
-
-```
-API_KEY = config.API_KEY
-PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
-ssl_verify = False
-```
-
-# ─────────────────────────────────────────────
-
-# Main Snowpark entrypoint
-
-# ─────────────────────────────────────────────
-
-def main(session: “Session”):
-
-```
-source_table = "SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS"
-
-try:
-    # ── 1. Pull unprocessed records from Snowflake ──────────────────────
-    query = f"""
-        SELECT
-            ROW_ID,
-            WORKER_ID,
-            CLIENT_ID,
-            CLIENT_NAME,
-            CONCAT(FIRST_NAME, ' ', LAST_NAME) AS WORKER_NAME,
-            CLIENT_NAME AS ACCOUNT_NAME
-        FROM {source_table}
-        WHERE API_PROCESSED = FALSE;
-    """
-
-    rows = pd.DataFrame(session.sql(query).collect())
-    print(f"\nProcessing {rows.shape[0]} rows")
-
-    # ── 2. Set request headers ───────────────────────────────────────────
-    HEADERS = {
-        'Content-Type': 'application/json',
-        'X-api-key': API_KEY
-    }
-
-    success_count = 0
-    error_count = 0
-
-    # ── 3. Iterate rows, call PDL, write response back to source row ─────
-    for idx, row in rows.iterrows():
-        try:
-            # Sanitise inputs
-            contact_name = (
-                row['WORKER_NAME'].replace("'", "''")
-                if pd.notna(row['WORKER_NAME']) else ""
-            )
-            account_name = (
-                row['ACCOUNT_NAME'].replace("'", "''")
-                if pd.notna(row['ACCOUNT_NAME']) else ""
-            )
-
-            # ── Fuzzy ES query ───────────────────────────────────────────
-            PARAMS = {
                 'query': {
                     "bool": {
-                        "must": [
+                        "should": [
+                            # First name wildcard (Jon vs Jonathan)
                             {
-                                "match": {
-                                    "full_name": {
-                                        "query": contact_name.lower(),
-                                        "fuzziness": "AUTO",
-                                        "operator": "and"
+                                "wildcard": {
+                                    "first_name": {
+                                        "value": first_name.lower() + "*"
                                     }
                                 }
                             },
+                            # Last name fuzzy
+                            {
+                                "match": {
+                                    "last_name": {
+                                        "query": last_name.lower(),
+                                        "fuzziness": "1"
+                                    }
+                                }
+                            },
+                            # Last name wildcard
+                            {
+                                "wildcard": {
+                                    "last_name": {
+                                        "value": last_name.lower() + "*"
+                                    }
+                                }
+                            },
+                            # Company name fuzzy
                             {
                                 "match": {
                                     "job_company_name": {
                                         "query": account_name.lower(),
-                                        "fuzziness": "AUTO",
-                                        "operator": "and"
+                                        "fuzziness": "AUTO"
+                                    }
+                                }
+                            },
+                            # Company name wildcard
+                            {
+                                "wildcard": {
+                                    "job_company_name": {
+                                        "value": "*".join(account_name.lower().split()) + "*"
                                     }
                                 }
                             }
-                        ]
+                        ],
+                        "minimum_should_match": 3
                     }
                 },
                 'size': 5,
@@ -356,30 +146,24 @@ try:
                 'titlecase': True
             }
 
-            # ── Fire request ─────────────────────────────────────────────
-            response = requests.get(
+
+                # Pass the parameters object to the Person Search API
+                response = requests.get(
                 PDL_URL,
                 headers=HEADERS,
                 params={"api_key": API_KEY},
                 json=PARAMS,
-                verify=ssl_verify
-            ).json()
+                verify= ssl_verify
+                ).json()
 
-            response_status = response.get('status', None)
-            response_data   = json.dumps(response.get('data', [])).replace("'", "\\'")
-            total_matches   = int(response.get('total', 0))
-            response_time   = str(datetime.now())
+                response_status = response.get('status', None)
+                response_data   = json.dumps(response.get('data', []))
+                total_matches   = int(response.get('total', 0))
+                response_time   = str(datetime.now())
 
-            # ── Write response back to source table row ──────────────────
-            # NOTE: Assumes these columns exist on the source table:
-            #   API_PROCESSED        BOOLEAN
-            #   API_PROCESSED_AT     TIMESTAMP
-            #   API_RESPONSE_STATUS  NUMBER
-            #   API_RESPONSE_DATA    VARIANT   (stores JSON; use PARSE_JSON)
-            #   API_TOTAL_MATCHES    NUMBER
-            #   API_RESPONSE_TIME    VARCHAR
-            update_query = f"""
-                UPDATE {source_table}
+                # Write results back to Snowflake source table
+                update_query = f"""
+                UPDATE SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
                 SET
                     API_PROCESSED        = TRUE,
                     API_PROCESSED_AT     = CURRENT_TIMESTAMP(),
@@ -387,36 +171,28 @@ try:
                     API_RESPONSE_DATA    = PARSE_JSON('{response_data}'),
                     API_TOTAL_MATCHES    = {total_matches},
                     API_RESPONSE_TIME    = '{response_time}'
-                WHERE ROW_ID = {row['ROW_ID']};
-            """
-            session.sql(update_query).collect()
+                WHERE RECORD_ID = '{record_id_sql}';
+                """
+                session.sql(update_query).collect()
 
-            # ── Log progress ─────────────────────────────────────────────
-            if response_status == 200:
-                success_count += 1
-                print(
-                    f"Row {idx + 1}/{rows.shape[0]}: "
-                    f"Match found for {row['WORKER_NAME']} "
-                    f"({total_matches} candidates) - updated ROW_ID {row['ROW_ID']}"
-                )
-            else:
-                print(
-                    f"Row {idx + 1}/{rows.shape[0]}: "
-                    f"No match for {row['WORKER_NAME']} "
-                    f"- Status: {response_status} - updated ROW_ID {row['ROW_ID']}"
-                )
+                # Log progress
+                if response_status == 200:
+                    success_count += 1
+                    print(f"Row {idx + 1}/{rows.shape[0]}: Match found for {row['FIRST_NAME']} {row['LAST_NAME']} - Total Matches: {total_matches}")
+                else:
+                    print(f"Row {idx + 1}/{rows.shape[0]}: No match for {row['FIRST_NAME']} {row['LAST_NAME']} - Status: {response.get('status')}")
+                
+                # Optional: Add a small delay to avoid rate limiting
+                time.sleep(1)
 
-            # Small delay to avoid rate limiting
-            time.sleep(1)
+            except Exception as row_error:
+                error_count += 1
+                print(f"Error processing row {idx + 1} (RECORD_ID {row['RECORD_ID']}): {row_error}")
 
-        except Exception as row_error:
-            error_count += 1
-            print(f"Error processing row {idx + 1} (ROW_ID {row['ROW_ID']}): {row_error}")
-
-            # Mark row so it doesn't get retried endlessly
+            # Mark row so it doesn't get retried
             try:
                 error_update = f"""
-                    UPDATE {source_table}
+                    UPDATE SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
                     SET
                         API_PROCESSED        = TRUE,
                         API_PROCESSED_AT     = CURRENT_TIMESTAMP(),
@@ -424,37 +200,34 @@ try:
                         API_RESPONSE_DATA    = PARSE_JSON('[]'),
                         API_TOTAL_MATCHES    = 0,
                         API_RESPONSE_TIME    = '{str(datetime.now())}'
-                    WHERE ROW_ID = {row['ROW_ID']};
+                    WHERE RECORD_ID = '{str(row["RECORD_ID"]).replace("'", "''")}';
                 """
                 session.sql(error_update).collect()
             except Exception as update_error:
-                print(f"  Also failed to write error state for ROW_ID {row['ROW_ID']}: {update_error}")
+                print(f"  Also failed to write error state for RECORD_ID {row['RECORD_ID']}: {update_error}")
 
-    # ── 4. Summary ───────────────────────────────────────────────────────
-    print(
-        f"\nSummary: {success_count} successful matches, "
-        f"{error_count} errors, "
-        f"out of {rows.shape[0]} total rows"
-    )
+        print(
+            f"\nSummary: {success_count} successful matches, "
+            f"{error_count} errors, "
+            f"out of {rows.shape[0]} total rows"
+        )
 
-except Exception as e:
-    print(e)
-    raise e
+    except Exception as e:
+        print(e)
+        raise e
 
-return 'Process Complete'
-```
+    return 'Process Complete'
 
-# ─────────────────────────────────────────────
 
-# Local debugging entrypoint
 
-# ─────────────────────────────────────────────
+# For local debugging
+# Beware you may need to type-convert arguments if you add input parameters
+if __name__ == "__main__": 
+    # Create a local Snowpark session
+    with Session.builder.config("local_testing", True).getOrCreate() as session:
+        print(main(session, *sys.argv[1:]))  # type: ignore
 
-if **name** == “**main**”:
-try:
-from snowflake.snowpark import Session
-with Session.builder.config(“local_testing”, True).getOrCreate() as session:
-print(main(session, *sys.argv[1:]))
-except Exception as e:
-print(f”Local run error: {e}”)
-print(“Tip: Session is a Snowflake runtime object. Run this inside Snowflake or set up a local Snowpark connection via config.py”)
+
+
+
+
