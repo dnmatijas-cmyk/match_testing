@@ -1,0 +1,241 @@
+import sys
+import json
+import uuid
+import time
+import requests
+import pandas as pd
+from datetime import datetime
+
+# ─────────────────────────────────────────────
+# Snowflake / local environment setup
+# ─────────────────────────────────────────────
+
+try:
+    import _snowflake  # Available when deployed to Snowflake
+    from snowflake.snowpark import Session
+
+    API_KEY = _snowflake.get_generic_secret_string('TOKEN')
+    PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
+    ssl_verify = True
+
+except ImportError:
+    import os
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    import config  # Local config.py for debugging
+
+    API_KEY = config.API_KEY
+    PDL_URL = "https://api.peopledatalabs.com/v5/person/search"
+    ssl_verify = False
+
+
+# ─────────────────────────────────────────────
+# Main Snowpark entrypoint
+# ─────────────────────────────────────────────
+
+def main(session: "Session"):
+
+    try:
+        # ── 1. Pull unprocessed records from Snowflake ──────────────────────
+        query = f"""
+            SELECT
+                ROW_ID,
+                WORKER_ID,
+                CLIENT_ID,
+                CLIENT_NAME,
+                CONCAT(FIRST_NAME, ' ', LAST_NAME) AS WORKER_NAME,
+                CLIENT_NAME AS ACCOUNT_NAME
+            FROM SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
+            WHERE API_PROCESSED = FALSE;
+        """
+
+        rows = pd.DataFrame(session.sql(query).collect())
+        print(f"\nProcessing {rows.shape[0]} rows")
+
+        # ── 2. Set request headers ───────────────────────────────────────────
+        HEADERS = {
+            'Content-Type': 'application/json',
+            'X-api-key': API_KEY
+        }
+
+        results = []
+
+        # ── 3. Iterate rows and call PDL ─────────────────────────────────────
+        for idx, row in rows.iterrows():
+            try:
+                # Sanitise inputs
+                contact_name = (
+                    row['WORKER_NAME'].replace("'", "''")
+                    if pd.notna(row['WORKER_NAME']) else ""
+                )
+                account_name = (
+                    row['ACCOUNT_NAME'].replace("'", "''")
+                    if pd.notna(row['ACCOUNT_NAME']) else ""
+                )
+
+                # ── Fuzzy ES query (replaces exact SQL match) ────────────────
+                # Uses 'match' with fuzziness=AUTO so minor name/company
+                # variations (typos, nicknames, abbreviations) still resolve.
+                # operator='and' ensures BOTH tokens in a name must appear,
+                # preventing false positives like "John" matching every John
+                # at the company.
+                # size=5 returns top candidates; adjust as needed.
+                PARAMS = {
+                    'query': {
+                        "bool": {
+                            "must": [
+                                {
+                                    "match": {
+                                        "full_name": {
+                                            "query": contact_name.lower(),
+                                            "fuzziness": "AUTO",
+                                            "operator": "and"
+                                        }
+                                    }
+                                },
+                                {
+                                    "match": {
+                                        "job_company_name": {
+                                            "query": account_name.lower(),
+                                            "fuzziness": "AUTO",
+                                            "operator": "and"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    'size': 5,
+                    'pretty': True,
+                    'titlecase': True
+                }
+
+                # ── Fire request ─────────────────────────────────────────────
+                response = requests.get(
+                    PDL_URL,
+                    headers=HEADERS,
+                    params={"api_key": API_KEY},
+                    json=PARAMS,
+                    verify=ssl_verify
+                ).json()
+
+                # ── Store result record ──────────────────────────────────────
+                result_record = {
+                    'REQUEST_UUID':      str(uuid.uuid4()),
+                    'ROW_ID':            row['ROW_ID'],
+                    'WORKER_ID':         row['WORKER_ID'],
+                    'CONTACT_NAME':      row['WORKER_NAME'],
+                    'ACCOUNT_ID':        row['CLIENT_ID'],
+                    'ACCOUNT_NAME':      row['CLIENT_NAME'],
+                    'RESPONSE_STATUS':   response.get('status', None),
+                    'RESPONSE_DATA':     json.dumps(response.get('data', [])),
+                    'TOTAL_MATCHES':     int(response.get('total', 0)),
+                    'API_RESPONSE_TIME': str(datetime.now())
+                }
+
+                results.append(result_record)
+
+                # ── Log progress ─────────────────────────────────────────────
+                if response.get("status") == 200:
+                    print(
+                        f"Row {idx + 1}/{rows.shape[0]}: "
+                        f"Match found for {row['WORKER_NAME']} "
+                        f"({response.get('total', 0)} candidates)"
+                    )
+                else:
+                    print(
+                        f"Row {idx + 1}/{rows.shape[0]}: "
+                        f"No match for {row['WORKER_NAME']} "
+                        f"- Status: {response.get('status')}"
+                    )
+
+                # Small delay to avoid rate limiting
+                time.sleep(1)
+
+            except Exception as row_error:
+                print(f"Error processing row {idx + 1}: {row_error}")
+                results.append({
+                    'REQUEST_UUID':      str(uuid.uuid4()),
+                    'ROW_ID':            row['ROW_ID'],
+                    'WORKER_ID':         row.get('WORKER_ID', None),
+                    'CONTACT_NAME':      row.get('WORKER_NAME', None),
+                    'ACCOUNT_ID':        row.get('CLIENT_ID', None),
+                    'ACCOUNT_NAME':      row.get('CLIENT_NAME', None),
+                    'RESPONSE_STATUS':   None,
+                    'RESPONSE_DATA':     json.dumps([]),
+                    'TOTAL_MATCHES':     0,
+                    'API_RESPONSE_TIME': str(datetime.now())
+                })
+
+        # ── 4. Write results to Snowflake ────────────────────────────────────
+        results_df = pd.DataFrame(results)
+        print(f"\nProcessed {len(results)} records. Writing to Snowflake...")
+
+        table_name = "SANDBOX.MMYERS.PDL_DNB_CEO_RESULTS_TEST"
+
+        from snowflake.snowpark import functions as F
+        snowpark_df = session.create_dataframe(results_df)
+        snowpark_df = snowpark_df.with_column(
+            "RESPONSE_DATA",
+            F.parse_json(snowpark_df["RESPONSE_DATA"])
+        )
+        snowpark_df.write.mode("append").save_as_table(table_name)
+
+        print(f"Successfully wrote {len(results)} records to {table_name}")
+
+        # ── 5. Mark processed records in source table ────────────────────────
+        processed_ids = results_df['ROW_ID'].dropna().tolist()
+
+        if processed_ids:
+            id_list = ", ".join(str(rid) for rid in processed_ids)
+            update_query = f"""
+                UPDATE SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS
+                SET API_PROCESSED = TRUE,
+                    API_PROCESSED_AT = CURRENT_TIMESTAMP()
+                WHERE ROW_ID IN ({id_list});
+            """
+            session.sql(update_query).collect()
+            print(f"Updated {len(processed_ids)} records as processed in SANDBOX.DMATIJAS.ENTERPRISE_ACTIVE_WORKERS")
+
+        # ── 6. Summary ───────────────────────────────────────────────────────
+        success_count = results_df[results_df['RESPONSE_STATUS'] == 200].shape[0]
+        print(f"\nSummary: {success_count} successful matches out of {len(results)} total requests")
+
+    except Exception as e:
+        print(e)
+
+        # Save local backup on failure (only useful during local debugging)
+        try:
+            with open(
+                r'c:\Users\mmyers1\Azure_Devops\snflk-dataload-people-data-labs\jira-api\snowpark\results_backup.json',
+                'w'
+            ) as f:
+                json.dump(results, f, indent=2)
+            print(f"Saved {len(results)} records to results_backup.json")
+
+            results_df.to_csv(
+                r'c:\Users\mmyers1\Azure_Devops\snflk-dataload-people-data-labs\jira-api\snowpark\results_backup.csv',
+                index=False
+            )
+            print(f"Saved {len(results_df)} records to results_backup.csv")
+        except Exception:
+            pass  # backup paths only exist locally; safe to skip in Snowflake
+
+        raise e
+
+    return 'Process Complete'
+
+
+# ─────────────────────────────────────────────
+# Local debugging entrypoint
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # NOTE: Session is only available inside Snowflake.
+    # To run locally, mock the session or use a local Snowpark connection.
+    try:
+        from snowflake.snowpark import Session
+        with Session.builder.config("local_testing", True).getOrCreate() as session:
+            print(main(session, *sys.argv[1:]))
+    except Exception as e:
+        print(f"Local run error: {e}")
+        print("Tip: Session is a Snowflake runtime object. Run this inside Snowflake or set up a local Snowpark connection via config.py")
